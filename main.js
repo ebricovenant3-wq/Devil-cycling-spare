@@ -1,7 +1,11 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { PlatformAPI, isElectron } from './src/platform.js';
+import { MeleeTrail } from './MeleeTrail.js';
 
 const SAVE_KEY = 'devils_cycling_spare_save_data';
 
@@ -354,20 +358,38 @@ function startBackgroundMusic() {
 // Scene, Camera, Renderer Setup
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x1a1a24);
+scene.fog = new THREE.FogExp2(0x0a0a0f, 0.025);
 
 const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 renderer.compile(scene, camera);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.2, 0.4, 0.85);
+composer.addPass(bloomPass);
+composer.setSize(window.innerWidth, window.innerHeight);
 
 // Lighting
 const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
 scene.add(ambientLight);
 const dirLight = new THREE.DirectionalLight(0xff4500, 1.2);
 dirLight.position.set(10, 20, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -30;
+dirLight.shadow.camera.right = 30;
+dirLight.shadow.camera.top = 30;
+dirLight.shadow.camera.bottom = -30;
+dirLight.shadow.camera.near = 1;
+dirLight.shadow.camera.far = 60;
+dirLight.shadow.bias = -0.0002;
 scene.add(dirLight);
 
 // Environment Floor
@@ -470,10 +492,18 @@ scene.add(playerGroup);
 
 // Signature Weapon (Axe / Blade Prototype)
 const weaponGeo = new THREE.BoxGeometry(0.2, 0.8, 0.2);
-const weaponMat = new THREE.MeshStandardMaterial({ color: 0x00ffff });
+const weaponMat = new THREE.MeshStandardMaterial({ color: 0x00ffff, emissive: 0x111111 });
 const weapon = new THREE.Mesh(weaponGeo, weaponMat);
 weapon.position.set(0.6, 1.2, 0);
 playerGroup.add(weapon);
+
+const rageLight = new THREE.PointLight(0xff4400, 0, 8, 2);
+rageLight.position.set(0, 1.5, 0);
+playerGroup.add(rageLight);
+
+const swordHiltOffset = new THREE.Vector3(0, 0, 0);
+const swordTipOffset = new THREE.Vector3(0, 2.5, 0);
+const bladeTrail = new MeleeTrail(scene, swordHiltOffset, swordTipOffset, 14, 0x00ff88);
 
 // Boss State Management
 let boss = null;
@@ -804,6 +834,7 @@ function deactivateSpartanRage() {
   bodyMat.color.setHex(0xbbbbbb);
   dirLight.color.setHex(0xff4500);
   dirLight.intensity = 1.2;
+  rageLight.intensity = 0;
 
   if (audioCtx && droneOsc1 && droneOsc2) {
     droneOsc1.frequency.setValueAtTime(55, audioCtx.currentTime);
@@ -829,6 +860,7 @@ function activateSpartanRage() {
   bodyMat.color.setHex(0xff2200);
   dirLight.color.setHex(0xff1100);
   dirLight.intensity = 2.5;
+  rageLight.intensity = 3.5;
 
   if (audioCtx && droneOsc1 && droneOsc2) {
     droneOsc1.frequency.setValueAtTime(110, audioCtx.currentTime);
@@ -866,6 +898,11 @@ let screenShakeDuration = 0;
 let screenShakeIntensity = 0.08;
 let hitStopTimer = 0;
 let originalCameraOffset = new THREE.Vector3(1.5, 2.5, 4);
+let isHeavyAttack = false;
+
+function triggerHitStop(durationMs = 50) {
+  hitStopTimer = Math.max(hitStopTimer, durationMs / 16.6667);
+}
 
 // Floating Damage Numbers
 const floatingTexts = [];
@@ -1072,6 +1109,36 @@ function fireProjectile() {
   });
 }
 
+function performLightAttack() {
+  if (isAttacking) return;
+
+  isAttacking = true;
+  isHeavyAttack = false;
+  bladeTrail.start();
+  bladeTrail.material.color.setHex(0x00ff88);
+
+  setTimeout(() => {
+    bladeTrail.stop();
+    isAttacking = false;
+    isHeavyAttack = false;
+  }, 220);
+}
+
+function performHeavyAttack() {
+  if (isAttacking) return;
+
+  isAttacking = true;
+  isHeavyAttack = true;
+  bladeTrail.start();
+  bladeTrail.material.color.setHex(isRageActive ? 0xff2200 : 0xff8800);
+
+  setTimeout(() => {
+    bladeTrail.stop();
+    isAttacking = false;
+    isHeavyAttack = false;
+  }, 420);
+}
+
 function triggerSpecialMove() {
   const aliveEnemies = getAliveEnemies();
   if (!isPlayerAlive || aliveEnemies.length === 0 || specialCooldown > 0 || comboCount < 3 || isAttacking) return;
@@ -1090,9 +1157,10 @@ function triggerSpecialMove() {
     target.health -= finisherDamage;
 
     screenShakeDuration = 18;
-    hitStopTimer = 8;
+    triggerHitStop(130);
     specialCooldown = 4.5;
     specialMoveFlash = 0.5;
+    performHeavyAttack();
 
     const specialText = new THREE.Sprite(
       new THREE.SpriteMaterial({
@@ -1208,7 +1276,12 @@ window.addEventListener('mousedown', (e) => {
   if (e.button === 0 && !isAttacking) {
     initAudio();
     playSwordSwish();
-    isAttacking = true;
+    const heavySwing = isRageActive || comboCount >= 3;
+    if (heavySwing) {
+      performHeavyAttack();
+    } else {
+      performLightAttack();
+    }
 
     // Combo System
     comboCount += 1;
@@ -1250,7 +1323,7 @@ window.addEventListener('mousedown', (e) => {
         }
 
         screenShakeDuration = 10;
-        hitStopTimer = 6;
+        triggerHitStop(90);
 
         const damageText = new THREE.Sprite(
           new THREE.SpriteMaterial({
@@ -1296,13 +1369,15 @@ window.addEventListener('mousedown', (e) => {
         }
 
         screenShakeDuration = 10;
-        hitStopTimer = 6;
+        triggerHitStop(90);
       }
     }
 
     setTimeout(() => {
       weapon.rotation.z += Math.PI / 2;
-      isAttacking = false;
+      if (!isHeavyAttack) {
+        isAttacking = false;
+      }
     }, 200);
   }
 });
@@ -1453,7 +1528,7 @@ function animate() {
   requestAnimationFrame(animate);
 
   if (!gameStarted) {
-    renderer.render(scene, camera);
+    composer.render();
     return;
   }
 
@@ -1464,7 +1539,7 @@ function animate() {
   }
 
   if (hitStopTimer > 0) {
-    hitStopTimer--;
+    hitStopTimer = Math.max(0, hitStopTimer - 1);
   }
 
   for (const enemy of enemies) {
@@ -1690,6 +1765,11 @@ function animate() {
     });
   }
 
+  if (weapon) {
+    const trailColor = isRageActive ? 0xff2200 : (isHeavyAttack ? 0xff8800 : 0x00ff88);
+    bladeTrail.update(weapon, trailColor);
+  }
+
   const aliveEnemies = getAliveEnemies();
   for (const enemy of aliveEnemies) {
     const direction = new THREE.Vector3();
@@ -1758,7 +1838,7 @@ function animate() {
     camera.lookAt(playerGroup.position.clone().add(new THREE.Vector3(0, 1.5, 0)));
   }
 
-  renderer.render(scene, camera);
+  composer.render();
 }
 
 animate();
